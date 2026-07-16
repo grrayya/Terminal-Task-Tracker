@@ -9,11 +9,22 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 DB_PATH = "task_log.json"
+SNOOZE_TIME_SECONDS = 14400 
 
 SCOPES = [
     'https://www.googleapis.com/auth/calendar.readonly',
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
+
+def load_db():
+    if not os.path.exists(DB_PATH):
+        return {"tasks": {}}
+    with open(DB_PATH, 'r') as f:
+        return json.load(f)
+
+def save_db(db):
+    with open(DB_PATH, 'w') as f:
+        json.dump(db, f, indent=4)
 
 def get_credentials():
     creds = None
@@ -47,7 +58,6 @@ def fetch_external_tasks():
         
         upcoming_meetings = cal_response.get('items', [])
         for meeting in upcoming_meetings:
-            # sometimes meetings don't have a summary if the time is just blocked off
             title = meeting.get('summary', 'Blocked Time')
             pending_todos.append({
                 "id": f"cal_{meeting['id']}",
@@ -57,7 +67,6 @@ def fetch_external_tasks():
 
     except HttpError as err:
         print(f"Calendar API choked: {err}")
-
 
     try:
         gmail_service = build('gmail', 'v1', credentials=creds)
@@ -74,8 +83,6 @@ def fetch_external_tasks():
             ).execute()
             
             headers = thread_meta.get('payload', {}).get('headers', [])
-            
-            # hack to pull out just the subject string from the headers array
             subject_line = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
             
             pending_todos.append({
@@ -88,6 +95,55 @@ def fetch_external_tasks():
         print(f"Skipping emails, Gmail API failed: {err}")
 
     return pending_todos
+
+def process_tasks():
+    db = load_db()
+    current_time = time.time()
+    
+    incoming_tasks = fetch_external_tasks()
+    for task in incoming_tasks:
+        if task["id"] not in db["tasks"]:
+            db["tasks"][task["id"]] = {
+                "title": task["title"],
+                "source": task["source"],
+                "status": "new",
+                "estimated_mins": 0,
+                "actual_mins": 0,
+                "ping_time": 0
+            }
+
+    for task_id, data in db["tasks"].items():
+        if data["status"] == "new" or (data["status"] == "snoozed" and current_time >= data["ping_time"]):
+            print(f"\n🔔 NEW TASK: {data['title']} ({data['source']})")
+            user_input = input("How many minutes will this take? (Enter number, or type 'later'): ").strip().lower()
+            
+            if user_input == 'later':
+                data["status"] = "snoozed"
+                data["ping_time"] = current_time + SNOOZE_TIME_SECONDS
+                print("Got it. I'll ping you about this again later.")
+            elif user_input.isdigit():
+                data["status"] = "active"
+                data["estimated_mins"] = int(user_input)
+                print(f"Tracked! Estimated: {data['estimated_mins']} mins. Get to work!")
+            else:
+                print("Invalid input. Skipping for now.")
+
+        elif data["status"] == "active":
+            print(f"\n✅ ACTIVE TASK: {data['title']}")
+            is_done = input("Did you finish this? (y/n): ").strip().lower()
+            
+            if is_done == 'y':
+                actual_time = input("Awesome. How many minutes did it *actually* take?: ").strip()
+                if actual_time.isdigit():
+                    data["status"] = "completed"
+                    data["actual_mins"] = int(actual_time)
+                    data["date_finished"] = datetime.datetime.now().strftime("%Y-%m-%d")
+                    print("Data logged. Great job!")
+                else:
+                    print("Please enter a valid number next time.")
+
+    save_db(db)
+
 def print_end_of_day_report(db):
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     
@@ -116,8 +172,26 @@ def print_end_of_day_report(db):
         total_actual += act
 
     daily_drift = total_actual - total_est
-    drift_text = f"took {daily_drift}m longer than expected" if daily_drift > 0 else f"finished {abs(daily_drift)}m faster than expected"
+    if daily_drift > 0:
+        drift_text = f"took {daily_drift}m longer than expected" 
+    elif daily_drift < 0:
+        drift_text = f"finished {abs(daily_drift)}m faster than expected"
+    else:
+        drift_text = "hit your estimates perfectly"
     
     print("-" * 35)
     print(f"Total Est: {total_est}m | Total Actual: {total_actual}m")
     print(f"Verdict: You {drift_text} overall.\n")
+
+
+if __name__ == "__main__":
+    print("Tracker active. (Press Ctrl+C to print daily summary and exit)")
+    try:
+        while True:
+            process_tasks()
+            time.sleep(300) 
+    except KeyboardInterrupt:
+        print("\nWrapping up...")
+        db = load_db()
+        print_end_of_day_report(db)
+        print("Shutting down tracker.")
